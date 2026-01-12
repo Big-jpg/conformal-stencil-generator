@@ -1,0 +1,6 @@
+streamlit>=1.28.0
+shapely>=2.0.0
+trimesh>=3.20.0
+svgpathtools>=1.4.1
+matplotlib>=3.8.0
+numpy>=1.24.0
