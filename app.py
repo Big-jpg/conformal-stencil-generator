@@ -15,7 +15,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from svg_parse import load_svg
-from geom2d import create_mask_plate, add_alignment_marks
+from geom2d import create_mask_plate, add_alignment_marks, add_sprues
 
 # Page configuration
 st.set_page_config(
@@ -65,6 +65,7 @@ with st.sidebar:
     if use_sprues:
         sprue_width = st.slider("Sprue width (mm)", 1.0, 5.0, 2.0, step=0.5)
         sprue_max_length = st.slider("Max sprue length (mm)", 10, 100, 50)
+        sprue_max_count = st.slider("Max sprue count", 1, 20, 10)
     
     st.subheader("Alignment Marks")
     use_marks = st.checkbox("Add alignment marks", value=False)
@@ -180,6 +181,15 @@ with col1:
                     clearance
                 )
                 
+                # Add sprues if enabled
+                if use_sprues:
+                    mask_plate = add_sprues(
+                        mask_plate,
+                        sprue_width,
+                        sprue_max_length,
+                        sprue_max_count
+                    )
+                
                 # Add alignment marks if enabled
                 if use_marks:
                     mask_plate = add_alignment_marks(
@@ -206,6 +216,8 @@ with col1:
             
         except Exception as e:
             st.error(f"❌ Error generating mask plate: {e}")
+            import traceback
+            st.code(traceback.format_exc())
             st.session_state.mask_plate = None
 
 with col2:
@@ -246,6 +258,6 @@ st.divider()
 
 st.markdown("""
 ---
-**Status:** Milestone 2 — Mask Plate Generation ✓  
-**Next:** Milestone 3 — Island Detection + Sprues
+**Status:** Milestone 3 — Island Detection + Sprues ✓  
+**Next:** Milestone 5 — 3D Extrusion + STL Export
 """)
