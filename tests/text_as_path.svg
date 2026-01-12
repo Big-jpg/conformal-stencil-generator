@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="200mm" height="60mm" viewBox="0 0 200 60" xmlns="http://www.w3.org/2000/svg">
+  <!-- Simple letter "A" as path (approximation) -->
+  <path d="M 30,50 L 50,10 L 70,50 M 40,35 L 60,35" 
+        stroke="black" stroke-width="5" fill="none"/>
+  
+  <!-- Simple letter "B" as filled paths -->
+  <path d="M 90,10 L 90,50 L 110,50 Q 120,45 120,37.5 Q 120,30 110,30 L 90,30 M 90,30 L 110,30 Q 120,25 120,17.5 Q 120,10 110,10 Z" 
+        fill="black"/>
+  
+  <!-- Simple letter "C" as path -->
+  <path d="M 150,10 Q 130,10 130,30 Q 130,50 150,50" 
+        stroke="black" stroke-width="5" fill="none"/>
+</svg>

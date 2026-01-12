@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="100mm" height="100mm" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+  <!-- Simple rectangle with circular cutout -->
+  <rect x="10" y="10" width="80" height="80" fill="black"/>
+  <circle cx="50" cy="50" r="20" fill="white"/>
+</svg>

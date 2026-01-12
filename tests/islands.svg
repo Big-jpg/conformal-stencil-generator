@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="150mm" height="100mm" viewBox="0 0 150 100" xmlns="http://www.w3.org/2000/svg">
+  <!-- Multiple disconnected regions -->
+  <rect x="10" y="10" width="30" height="30" fill="black"/>
+  <rect x="60" y="10" width="30" height="30" fill="black"/>
+  <rect x="110" y="10" width="30" height="30" fill="black"/>
+  <circle cx="25" cy="70" r="15" fill="black"/>
+  <circle cx="75" cy="70" r="15" fill="black"/>
+  <circle cx="125" cy="70" r="15" fill="black"/>
+</svg>
