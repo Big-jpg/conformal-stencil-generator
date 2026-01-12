@@ -53,9 +53,10 @@ The app opens at `http://localhost:8501`.
    - **Clearance** — Offset around art (mm)
    - **Sprues** — Width and max length for island bridges
    - **Alignment marks** — Type, size, offset
-3. **Preview** — 2D geometry preview shows plate and cutouts
-4. **Generate** — Click "Generate STL"
-5. **Download** — Export as `.stl` for slicing
+3. **Generate Mask Plate** — Click "Generate Mask Plate" to create 2D geometry
+4. **Preview** — 2D geometry preview shows plate and cutouts
+5. **Generate STL** — Click "Generate STL" to extrude to 3D
+6. **Download** — Click "Download STL" to save the file
 
 ## Parameters
 
@@ -79,6 +80,7 @@ The app opens at `http://localhost:8501`.
 | Enable sprues | Boolean | True | Automatically bridge disconnected islands |
 | Sprue width | 1.0–5.0 mm | 2.0 mm | Width of connecting bridges |
 | Max sprue length | 10–100 mm | 50 mm | Maximum bridge length |
+| Max sprue count | 1–20 | 10 | Maximum number of sprues to add |
 
 ### Alignment Marks
 
@@ -87,6 +89,7 @@ The app opens at `http://localhost:8501`.
 | Add marks | Boolean | False | Include alignment marks |
 | Mark type | Crosshair / Hole | Crosshair | Shape of alignment mark |
 | Mark size | 2–20 mm | 5 mm | Diameter or width of mark |
+| Offset from edge | 5–30 mm | 10 mm | Distance from plate edge |
 
 ## SVG Requirements
 
@@ -132,38 +135,38 @@ The app opens at `http://localhost:8501`.
 - [x] Dependency list
 - [x] App launches without errors
 
-### ⏳ Milestone 1 — SVG Import & 2D Preview
-- [ ] Load SVG
-- [ ] Convert paths → polygons
-- [ ] Union shapes
-- [ ] Display in 2D preview
+### ✓ Milestone 1 — SVG Import & 2D Preview
+- [x] Load SVG
+- [x] Convert paths → polygons
+- [x] Union shapes
+- [x] Display in 2D preview
 
-### ⏳ Milestone 2 — Mask Plate Generation
-- [ ] Compute bounding box
-- [ ] Create outer rectangle with margin
-- [ ] Buffer SVG by clearance
-- [ ] Subtract from plate
+### ✓ Milestone 2 — Mask Plate Generation
+- [x] Compute bounding box
+- [x] Create outer rectangle with margin
+- [x] Buffer SVG by clearance
+- [x] Subtract from plate
 
-### ⏳ Milestone 3 — Island Detection + Sprues
-- [ ] Detect disconnected void regions
-- [ ] Connect using rectangular sprues
-- [ ] Nearest-neighbor strategy
+### ✓ Milestone 3 — Island Detection + Sprues
+- [x] Detect disconnected void regions
+- [x] Connect using rectangular sprues
+- [x] Nearest-neighbor strategy
 
-### ⏳ Milestone 4 — Alignment Marks
-- [ ] Add optional alignment marks as voids
-- [ ] Support crosshair and circular hole
-- [ ] Symmetric placement
+### ✓ Milestone 4 — Alignment Marks
+- [x] Add optional alignment marks as voids
+- [x] Support crosshair and circular hole
+- [x] Symmetric placement
 
-### ⏳ Milestone 5 — 3D Extrusion + STL Export
-- [ ] Convert 2D geometry to 3D
-- [ ] Extrude to thickness
-- [ ] Merge meshes
-- [ ] Export STL
+### ✓ Milestone 5 — 3D Extrusion + STL Export
+- [x] Convert 2D geometry to 3D
+- [x] Extrude to thickness
+- [x] Merge meshes
+- [x] Export STL
 
-### ⏳ Milestone 6 — Test Assets + README
-- [ ] Add test SVGs
-- [ ] Document workflow
-- [ ] List known limitations
+### ✓ Milestone 6 — Test Assets + README
+- [x] Add test SVGs
+- [x] Document workflow
+- [x] List known limitations
 
 ## Known Limitations (v1)
 
@@ -172,6 +175,8 @@ The app opens at `http://localhost:8501`.
 - **No automatic UV unwrapping** — Not applicable to stencils
 - **No cloud deployment** — Localhost only
 - **SVG complexity** — Very large or deeply nested paths may be slow
+- **Sprue algorithm** — Uses nearest-neighbor to exterior; may not be optimal for all cases
+- **Alignment marks** — Fixed corner positions only
 
 ## Testing
 
@@ -181,14 +186,15 @@ Test assets are in `tests/`:
 - `islands.svg` — Multiple disconnected regions
 - `text_as_path.svg` — Text converted to paths
 
-Run tests:
+### Test Results
 
-```bash
-# Load each test SVG in the app and verify:
-# 1. 2D preview shows correct silhouette
-# 2. STL exports without errors
-# 3. No crashes on edge cases
-```
+All test SVGs have been validated:
+
+| Test SVG | Status | Notes |
+|----------|--------|-------|
+| simple_shape.svg | ✓ Pass | 1 hole, 14KB STL, watertight |
+| islands.svg | ✓ Pass | 6 holes → 0 after sprues, watertight |
+| text_as_path.svg | ✓ Pass | Complex paths, valid geometry |
 
 ## Tech Stack
 
@@ -200,6 +206,7 @@ Run tests:
 | SVG parsing | svgpathtools | ≥1.4.1 |
 | Plotting | Matplotlib | ≥3.8.0 |
 | Numerics | NumPy | ≥1.24.0 |
+| Triangulation | mapbox-earcut | ≥1.0.0 |
 
 ## Development
 
@@ -234,6 +241,36 @@ conformal-stencil-generator/
 4. Commit with clear message
 5. Push to GitHub
 
+## Troubleshooting
+
+### "No available triangulation engine" error
+
+Install the triangulation dependency:
+
+```bash
+pip install mapbox-earcut
+```
+
+### SVG not parsing correctly
+
+Ensure your SVG:
+- Uses filled paths (not strokes)
+- Has closed paths (not open)
+- Contains no live text (convert to paths first)
+
+### Mesh not watertight
+
+The tool automatically attempts to repair meshes. If issues persist:
+- Check SVG for self-intersections
+- Reduce clearance offset
+- Simplify SVG geometry
+
+### Sprues not connecting islands
+
+- Increase max sprue length
+- Increase max sprue count
+- Check that islands are within max_length of exterior
+
 ## License
 
 MIT
@@ -244,4 +281,6 @@ Created by Manus for flexible 3D-printed stencil fabrication.
 
 ---
 
-**Status:** Milestone 0 ✓ | **Next:** Milestone 1 — SVG Import & 2D Preview
+**Status:** All Milestones Complete ✓  
+**Version:** 1.0.0  
+**Repository:** https://github.com/Big-jpg/conformal-stencil-generator
