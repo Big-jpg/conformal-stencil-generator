@@ -4,3 +4,4 @@ trimesh>=3.20.0
 svgpathtools>=1.4.1
 matplotlib>=3.8.0
 numpy>=1.24.0
+mapbox-earcut>=1.0.0

@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from svg_parse import load_svg
 from geom2d import create_mask_plate, add_alignment_marks, add_sprues
+from mesh3d import extrude_to_mesh, export_stl, validate_mesh, get_mesh_info
 
 # Page configuration
 st.set_page_config(
@@ -32,6 +33,10 @@ if 'metadata' not in st.session_state:
     st.session_state.metadata = None
 if 'mask_plate' not in st.session_state:
     st.session_state.mask_plate = None
+if 'mesh' not in st.session_state:
+    st.session_state.mesh = None
+if 'stl_path' not in st.session_state:
+    st.session_state.stl_path = None
 
 # Title and description
 st.title("🎨 Flexible Conformal Stencil Generator")
@@ -248,16 +253,62 @@ col_export1, col_export2 = st.columns(2)
 
 with col_export1:
     if st.button("🔄 Generate STL", disabled=(st.session_state.mask_plate is None)):
-        st.info("STL generation coming in Milestone 5")
+        try:
+            with st.spinner("Generating 3D mesh..."):
+                # Extrude to 3D
+                mesh = extrude_to_mesh(st.session_state.mask_plate, plate_thickness)
+                st.session_state.mesh = mesh
+                
+                # Validate mesh
+                is_valid, message = validate_mesh(mesh)
+                
+                if is_valid:
+                    st.success(f"✓ 3D mesh generated! {message}")
+                    
+                    # Get mesh info
+                    mesh_info = get_mesh_info(mesh)
+                    st.info(f"""
+                    **Mesh Info:**
+                    - Vertices: {mesh_info['vertices']:,}
+                    - Faces: {mesh_info['faces']:,}
+                    - Watertight: {'Yes' if mesh_info['watertight'] else 'No'}
+                    - Volume: {mesh_info['volume']:.2f} mm³ (if watertight)
+                    - Surface area: {mesh_info['surface_area']:.2f} mm²
+                    """)
+                    
+                    # Export to temporary file
+                    stl_path = Path(tempfile.gettempdir()) / "stencil_output.stl"
+                    export_stl(mesh, str(stl_path))
+                    st.session_state.stl_path = str(stl_path)
+                    
+                else:
+                    st.warning(f"⚠️ Mesh generated but has issues: {message}")
+                    st.session_state.mesh = mesh
+                    
+        except Exception as e:
+            st.error(f"❌ Error generating STL: {e}")
+            import traceback
+            st.code(traceback.format_exc())
+            st.session_state.mesh = None
 
 with col_export2:
-    if st.button("💾 Download STL", disabled=True):
-        st.info("STL export coming in Milestone 5")
+    if st.session_state.stl_path and Path(st.session_state.stl_path).exists():
+        with open(st.session_state.stl_path, 'rb') as f:
+            stl_data = f.read()
+        
+        st.download_button(
+            label="💾 Download STL",
+            data=stl_data,
+            file_name="conformal_stencil.stl",
+            mime="application/octet-stream"
+        )
+    else:
+        st.button("💾 Download STL", disabled=True)
 
 st.divider()
 
 st.markdown("""
 ---
-**Status:** Milestone 3 — Island Detection + Sprues ✓  
-**Next:** Milestone 5 — 3D Extrusion + STL Export
+**Status:** Milestone 5 — 3D Extrusion + STL Export ✓  
+**Next:** Milestone 6 — Test Assets + README
 """)
