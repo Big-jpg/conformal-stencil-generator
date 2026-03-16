@@ -1,3 +1,4 @@
+# app.py
 from pathlib import Path
 import sys
 import tempfile
@@ -9,14 +10,17 @@ import matplotlib.pyplot as plt
 import streamlit as st
 from shapely.geometry import MultiPolygon, Polygon
 
-from geom2d import add_alignment_marks, add_sprues, create_mask_plate
+from geom2d import add_alignment_marks
 from mesh3d import export_stl, extrude_to_mesh, get_mesh_info, validate_mesh
 from pipelines import RasterSilhouettePipeline
 from raster_io import load_raster, normalize_canvas
 from svg_parse import load_svg
+from variants import VariantResult, run_raster_variants, run_svg_variants
 
 
-# Page configuration
+# ---------------------------------------------------------------------------
+# Page config
+# ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="Conformal Stencil Generator",
     page_icon="🎨",
@@ -25,578 +29,385 @@ st.set_page_config(
 )
 
 
-# Initialize session state
-if "geometry" not in st.session_state:
-    st.session_state.geometry = None
-if "metadata" not in st.session_state:
-    st.session_state.metadata = None
-if "mask_plate" not in st.session_state:
-    st.session_state.mask_plate = None
-if "mesh" not in st.session_state:
-    st.session_state.mesh = None
-if "stl_path" not in st.session_state:
-    st.session_state.stl_path = None
-if "debug_images" not in st.session_state:
-    st.session_state.debug_images = {}
-if "uploaded_filename" not in st.session_state:
-    st.session_state.uploaded_filename = None
-if "input_kind" not in st.session_state:
-    st.session_state.input_kind = None
-if "uploaded_file_signature" not in st.session_state:
-    st.session_state.uploaded_file_signature = None
+# ---------------------------------------------------------------------------
+# Session state initialisation
+# ---------------------------------------------------------------------------
+_STATE_KEYS = {
+    "geometry": None,
+    "metadata": None,
+    "normalized_rgb": None,
+    "target_width_mm": 120.0,
+    "target_height_mm": 120.0,
+    "variants": None,          # List[VariantResult] after generation
+    "debug_images": {},
+    "uploaded_filename": None,
+    "input_kind": None,
+    "uploaded_file_signature": None,
+}
+for k, v in _STATE_KEYS.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 
-# Title and description
-st.title("🎨 Flexible Conformal Stencil Generator")
-st.markdown(
-    """
-Convert 2D SVG vector art or high-contrast raster art into watertight,
-3D-printable STL files optimized for flexible materials.
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-**Workflow:**
-1. Upload SVG, PNG, JPG, JPEG, or WEBP
-2. Configure stencil parameters
-3. Preview 2D geometry
-4. Generate 3D mesh
-5. Export STL for slicing
-"""
-)
-st.divider()
+def _reset_downstream() -> None:
+    st.session_state.variants = None
 
 
-def reset_downstream_state() -> None:
-    """Reset derived artifacts when source geometry changes."""
-    st.session_state.mask_plate = None
-    st.session_state.mesh = None
-    st.session_state.stl_path = None
+def _clear_all() -> None:
+    for k, v in _STATE_KEYS.items():
+        st.session_state[k] = v
 
 
-def clear_all_loaded_state() -> None:
-    """Clear all loaded input and downstream state."""
-    st.session_state.geometry = None
-    st.session_state.metadata = None
-    st.session_state.mask_plate = None
-    st.session_state.mesh = None
-    st.session_state.stl_path = None
-    st.session_state.debug_images = {}
-    st.session_state.uploaded_filename = None
-    st.session_state.input_kind = None
-    st.session_state.uploaded_file_signature = None
-
-
-def plot_geometry(
-    geometry: Polygon | MultiPolygon,
-    title: str = "2D Preview",
-):
-    """Plot 2D geometry using matplotlib."""
-    fig, ax = plt.subplots(figsize=(10, 10))
-
-    if isinstance(geometry, Polygon):
-        geoms = [geometry]
-    else:
-        geoms = list(geometry.geoms)
-
-    for geom in geoms:
-        x, y = geom.exterior.xy
-        ax.fill(x, y, alpha=0.5, fc="steelblue", ec="black", linewidth=2)
-
-        for interior in geom.interiors:
-            x, y = interior.xy
-            ax.fill(x, y, alpha=1.0, fc="white", ec="red", linewidth=1)
-
-    ax.set_aspect("equal")
-    ax.grid(True, alpha=0.3)
-    ax.set_title(title, fontsize=14, fontweight="bold")
-    ax.set_xlabel("X (mm)")
-    ax.set_ylabel("Y (mm)")
-    return fig
-
-
-def plot_mask_plate(plate: Polygon, title: str = "Mask Plate"):
-    """Plot mask plate with holes."""
-    fig, ax = plt.subplots(figsize=(10, 10))
-
+def _plot_plate(plate: Polygon, title: str = "Mask Plate", figsize: float = 5.0):
+    fig, ax = plt.subplots(figsize=(figsize, figsize))
     x, y = plate.exterior.xy
-    ax.fill(
-        x,
-        y,
-        alpha=0.7,
-        fc="lightgray",
-        ec="black",
-        linewidth=2,
-        label="Plate",
-    )
-
+    ax.fill(x, y, alpha=0.7, fc="lightgray", ec="black", linewidth=1.5)
     for interior in plate.interiors:
         x, y = interior.xy
-        ax.fill(
-            x,
-            y,
-            alpha=1.0,
-            fc="white",
-            ec="red",
-            linewidth=2,
-            label="Cutout",
-        )
-
+        ax.fill(x, y, alpha=1.0, fc="white", ec="#e05050", linewidth=1.0)
     ax.set_aspect("equal")
-    ax.grid(True, alpha=0.3)
-    ax.set_title(title, fontsize=14, fontweight="bold")
-    ax.set_xlabel("X (mm)")
-    ax.set_ylabel("Y (mm)")
+    ax.grid(True, alpha=0.2)
+    ax.set_title(title, fontsize=10, fontweight="bold")
+    ax.set_xlabel("X (mm)", fontsize=8)
+    ax.set_ylabel("Y (mm)", fontsize=8)
+    ax.tick_params(labelsize=7)
+    fig.tight_layout()
     return fig
 
 
-# Sidebar for parameters
-with st.sidebar:
-    st.header("⚙️ Parameters")
-    st.info("Configure stencil generation parameters here.")
+def _plot_geometry(geometry: Polygon | MultiPolygon, title: str, figsize: float = 5.0):
+    fig, ax = plt.subplots(figsize=(figsize, figsize))
+    geoms = [geometry] if isinstance(geometry, Polygon) else list(geometry.geoms)
+    for geom in geoms:
+        x, y = geom.exterior.xy
+        ax.fill(x, y, alpha=0.5, fc="steelblue", ec="black", linewidth=1.5)
+        for interior in geom.interiors:
+            x, y = interior.xy
+            ax.fill(x, y, alpha=1.0, fc="white", ec="#e05050", linewidth=0.8)
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.2)
+    ax.set_title(title, fontsize=10, fontweight="bold")
+    ax.set_xlabel("X (mm)", fontsize=8)
+    ax.set_ylabel("Y (mm)", fontsize=8)
+    ax.tick_params(labelsize=7)
+    fig.tight_layout()
+    return fig
 
-    st.subheader("Plate Configuration")
+
+def _stl_bytes(plate: Polygon, thickness: float) -> tuple[bytes | None, str]:
+    """
+    Extrude plate to mesh and return (stl_bytes, status_message).
+    Always returns bytes if extrusion succeeds, regardless of watertight status.
+    """
+    try:
+        mesh = extrude_to_mesh(plate, thickness)
+        is_valid, msg = validate_mesh(mesh)
+        with tempfile.NamedTemporaryFile(suffix=".stl", delete=False) as f:
+            tmp_path = f.name
+        export_stl(mesh, tmp_path)
+        with open(tmp_path, "rb") as f:
+            data = f.read()
+        Path(tmp_path).unlink(missing_ok=True)
+        info = get_mesh_info(mesh)
+        status = (
+            f"{'Watertight' if info['watertight'] else 'Non-watertight'} | "
+            f"{info['vertices']:,} verts | {info['faces']:,} faces"
+        )
+        if not is_valid:
+            status = f"[issues: {msg}] " + status
+        return data, status
+    except Exception as exc:
+        return None, f"Extrusion failed: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# Sidebar — shared plate parameters only
+# ---------------------------------------------------------------------------
+with st.sidebar:
+    st.header("Parameters")
+
+    st.subheader("Plate")
     plate_margin = st.slider("Plate margin (mm)", 5, 50, 10)
     plate_thickness = st.slider("Plate thickness (mm)", 1.0, 5.0, 2.0, step=0.5)
 
-    st.subheader("Geometry")
-    clearance = st.slider("Clearance offset (mm)", 0.0, 2.0, 0.5, step=0.1)
-
-    st.subheader("Sprues (Island Bridges)")
-    use_sprues = st.checkbox("Enable sprues for disconnected islands", value=True)
-    if use_sprues:
-        sprue_width = st.slider("Sprue width (mm)", 1.0, 5.0, 2.0, step=0.5)
-        sprue_max_length = st.slider("Max sprue length (mm)", 10, 100, 50)
-        sprue_max_count = st.slider("Max sprue count", 1, 20, 10)
-    else:
-        sprue_width = 2.0
-        sprue_max_length = 50
-        sprue_max_count = 10
-
     st.subheader("Alignment Marks")
-    use_marks = st.checkbox("Add alignment marks", value=False)
+    use_marks = st.checkbox("Add alignment marks to all variants", value=False)
     if use_marks:
         mark_type = st.radio("Mark type", ["Crosshair", "Circular hole"])
         mark_size = st.slider("Mark size (mm)", 2, 20, 5)
         mark_offset = st.slider("Offset from edge (mm)", 5, 30, 10)
     else:
-        mark_type = "Crosshair"
-        mark_size = 5
-        mark_offset = 10
+        mark_type, mark_size, mark_offset = "Crosshair", 5, 10
 
-    st.subheader("Raster Pipeline")
+    st.subheader("Raster Input")
     target_width_mm = st.number_input(
-        "Target artwork width (mm)",
-        min_value=10.0,
-        max_value=500.0,
-        value=120.0,
-        step=5.0,
+        "Target artwork width (mm)", min_value=10.0, max_value=500.0, value=120.0, step=5.0,
     )
-
     lock_aspect = st.checkbox("Preserve aspect ratio", value=True)
-
     raster_target_height_mm = None
     if not lock_aspect:
         raster_target_height_mm = st.number_input(
-            "Target artwork height (mm)",
-            min_value=10.0,
-            max_value=500.0,
-            value=120.0,
-            step=5.0,
+            "Target artwork height (mm)", min_value=10.0, max_value=500.0, value=120.0, step=5.0,
         )
+    fit_mode = st.selectbox("Canvas fit mode", options=["contain", "cover"], index=0)
 
-    fit_mode = st.selectbox(
-        "Canvas fit mode",
-        options=["contain", "cover"],
-        index=0,
-    )
-
-    auto_threshold = st.checkbox("Auto threshold (Otsu)", value=True)
-    threshold = st.slider(
-        "Manual threshold",
-        min_value=0,
-        max_value=255,
-        value=128,
-        step=1,
-        disabled=auto_threshold,
-    )
-
-    invert = st.checkbox("Invert mask", value=False)
-    blur_px = st.slider("Blur (px)", 0, 5, 1, 1)
-    morph_open_px = st.slider("Morph open (px)", 0, 5, 1, 1)
-    morph_close_px = st.slider("Morph close (px)", 0, 5, 2, 1)
-
-    min_component_area_px = st.number_input(
-        "Minimum component area (px)",
-        min_value=1,
-        max_value=10000,
-        value=32,
-        step=1,
-    )
-
-    min_area_mm2 = st.number_input(
-        "Minimum output region area (mm^2)",
-        min_value=0.0,
-        max_value=1000.0,
-        value=0.75,
-        step=0.05,
-    )
-
-    min_feature_mm = st.number_input(
-        "Minimum feature size (mm)",
-        min_value=0.0,
-        max_value=10.0,
-        value=0.25,
-        step=0.05,
-    )
-
-    simplify_tolerance_mm = st.number_input(
-        "Simplify tolerance (mm)",
-        min_value=0.0,
-        max_value=5.0,
-        value=0.15,
-        step=0.05,
+    st.divider()
+    st.caption(
+        "Variant-specific settings (threshold, invert, blur, morphology, sprues) "
+        "are controlled by the preset strategies — no manual tuning required."
     )
 
 
-# Main content area
-col1, col2 = st.columns(2)
+# ---------------------------------------------------------------------------
+# Title
+# ---------------------------------------------------------------------------
+st.title("Conformal Stencil Generator")
+st.markdown(
+    "Upload artwork → Generate all variant mask plates simultaneously → "
+    "Compare previews → Download the STL that works best."
+)
+st.divider()
 
-with col1:
-    st.subheader("📤 Upload Artwork")
-    uploaded_file = st.file_uploader(
-        "Choose an artwork file",
-        type=["svg", "png", "jpg", "jpeg", "webp"],
-    )
 
-    if uploaded_file is not None:
-        suffix = Path(uploaded_file.name).suffix.lower()
-        file_signature = f"{uploaded_file.name}:{uploaded_file.size}"
-        needs_reprocess = file_signature != st.session_state.uploaded_file_signature
+# ---------------------------------------------------------------------------
+# Upload section
+# ---------------------------------------------------------------------------
+st.subheader("Upload Artwork")
+uploaded_file = st.file_uploader(
+    "SVG, PNG, JPG, JPEG, or WEBP",
+    type=["svg", "png", "jpg", "jpeg", "webp"],
+)
 
-        if needs_reprocess:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
-                tmp_file.write(uploaded_file.getbuffer())
-                tmp_path = Path(tmp_file.name)
+if uploaded_file is not None:
+    suffix = Path(uploaded_file.name).suffix.lower()
+    file_signature = f"{uploaded_file.name}:{uploaded_file.size}"
+    needs_reprocess = file_signature != st.session_state.uploaded_file_signature
 
-            try:
-                reset_downstream_state()
+    if needs_reprocess:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
+            tmp_file.write(uploaded_file.getbuffer())
+            tmp_path = Path(tmp_file.name)
 
-                if suffix == ".svg":
-                    with st.spinner("Parsing SVG..."):
-                        geometry, metadata = load_svg(tmp_path)
+        try:
+            _reset_downstream()
 
-                    st.session_state.geometry = geometry
-                    st.session_state.metadata = metadata
-                    st.session_state.debug_images = {}
-                    st.session_state.input_kind = "svg"
-                    st.session_state.uploaded_filename = uploaded_file.name
-                    st.session_state.uploaded_file_signature = file_signature
+            if suffix == ".svg":
+                with st.spinner("Parsing SVG..."):
+                    geometry, metadata = load_svg(tmp_path)
 
-                    st.success(f"✓ Loaded SVG: {uploaded_file.name}")
+                st.session_state.geometry = geometry
+                st.session_state.metadata = metadata
+                st.session_state.normalized_rgb = None
+                st.session_state.debug_images = {}
+                st.session_state.input_kind = "svg"
+                st.session_state.uploaded_filename = uploaded_file.name
+                st.session_state.uploaded_file_signature = file_signature
+                st.success(f"Loaded SVG: {uploaded_file.name}")
 
-                else:
-                    with st.spinner("Processing raster image..."):
-                        image_rgb, raster_meta = load_raster(tmp_path)
-                        source_h, source_w = image_rgb.shape[:2]
-                        target_aspect_ratio = source_w / source_h if source_h else 1.0
+            else:
+                with st.spinner("Processing raster image..."):
+                    image_rgb, raster_meta = load_raster(tmp_path)
+                    source_h, source_w = image_rgb.shape[:2]
+                    target_aspect_ratio = source_w / source_h if source_h else 1.0
 
-                        normalized_rgb, norm_meta = normalize_canvas(
-                            image_rgb=image_rgb,
-                            target_aspect_ratio=target_aspect_ratio,
-                            fit_mode=fit_mode,
-                            max_dim_px=1024,
-                            background=255,
-                        )
+                    normalized_rgb, norm_meta = normalize_canvas(
+                        image_rgb=image_rgb,
+                        target_aspect_ratio=target_aspect_ratio,
+                        fit_mode=fit_mode,
+                        max_dim_px=1024,
+                        background=255,
+                    )
 
-                        if lock_aspect:
-                            target_height_mm = target_width_mm * (
-                                normalized_rgb.shape[0] / normalized_rgb.shape[1]
-                            )
-                        else:
-                            target_height_mm = raster_target_height_mm
+                    if lock_aspect:
+                        t_h = target_width_mm * (normalized_rgb.shape[0] / normalized_rgb.shape[1])
+                    else:
+                        t_h = raster_target_height_mm or target_width_mm
 
-                        pipeline_settings = {
-                            "target_width_mm": target_width_mm,
-                            "target_height_mm": target_height_mm,
-                            "auto_threshold": auto_threshold,
-                            "threshold": threshold,
-                            "invert": invert,
-                            "blur_px": blur_px,
-                            "morph_open_px": morph_open_px,
-                            "morph_close_px": morph_close_px,
-                            "min_component_area_px": min_component_area_px,
-                            "min_area_mm2": min_area_mm2,
-                            "min_feature_mm": min_feature_mm,
-                            "simplify_tolerance_mm": simplify_tolerance_mm,
-                        }
-
-                        pipeline = RasterSilhouettePipeline()
-                        result = pipeline.run(normalized_rgb, pipeline_settings)
-
-                    st.session_state.geometry = result.geometry
-                    st.session_state.metadata = {
-                        **raster_meta,
-                        **norm_meta,
-                        **result.metadata,
+                    st.session_state.geometry = None
+                    st.session_state.normalized_rgb = normalized_rgb
+                    st.session_state.target_width_mm = target_width_mm
+                    st.session_state.target_height_mm = t_h
+                    st.session_state.metadata = {**raster_meta, **norm_meta}
+                    st.session_state.debug_images = {
+                        "input_rgb": image_rgb,
+                        "normalized_rgb": normalized_rgb,
                     }
-                    st.session_state.debug_images = result.debug_images
                     st.session_state.input_kind = "raster"
                     st.session_state.uploaded_filename = uploaded_file.name
                     st.session_state.uploaded_file_signature = file_signature
+                    st.success(f"Loaded raster: {uploaded_file.name}")
 
-                    st.success(f"✓ Loaded raster image: {uploaded_file.name}")
-
-                    if (
-                        st.session_state.geometry is None
-                        or st.session_state.geometry.is_empty
-                    ):
-                        st.warning(
-                            "The current settings produced empty geometry. "
-                            "Adjust threshold, invert, or cleanup settings."
-                        )
-
-            except Exception as e:
-                st.error(f"❌ Error processing uploaded file: {e}")
-                clear_all_loaded_state()
-
-                import traceback
-
-                st.code(traceback.format_exc())
-
-            finally:
-                tmp_path.unlink(missing_ok=True)
-
-        else:
-            st.info(f"Using cached artwork: {uploaded_file.name}")
-
-        if st.session_state.input_kind == "svg" and st.session_state.metadata:
-            metadata = st.session_state.metadata
-            st.info(
-                f"""
-**Metadata:**
-- Paths: {metadata.get('num_paths', 'N/A')}
-- Valid polygons: {metadata.get('num_valid_polygons', 'N/A')}
-- Width: {metadata.get('width', 0.0):.2f} mm
-- Height: {metadata.get('height', 0.0):.2f} mm
-- Area: {metadata.get('area', 0.0):.2f} mm²
-"""
-            )
-
-        elif st.session_state.input_kind == "raster" and st.session_state.metadata:
-            metadata = st.session_state.metadata
-            st.info(
-                f"""
-**Raster Metadata:**
-- Original size: {metadata.get('original_width_px', 0)} x {metadata.get('original_height_px', 0)} px
-- Canvas size: {metadata.get('canvas_width_px', 0)} x {metadata.get('canvas_height_px', 0)} px
-- Target width: {metadata.get('target_width_mm', 0.0):.2f} mm
-- Target height: {metadata.get('target_height_mm', 0.0):.2f} mm
-- Threshold: {metadata.get('threshold_used', 'N/A')}
-- Components kept: {metadata.get('components_kept', 0)}
-- Polygon count: {metadata.get('polygon_count', 0)}
-"""
-            )
-
+        except Exception as exc:
+            import traceback as _tb
+            st.error(f"Error processing file: {exc}")
+            st.code(_tb.format_exc())
+            _clear_all()
+        finally:
+            tmp_path.unlink(missing_ok=True)
     else:
-        if st.session_state.uploaded_file_signature is not None:
-            clear_all_loaded_state()
+        st.info(f"Using cached artwork: {uploaded_file.name}")
 
-        st.warning("No artwork uploaded yet")
-
-    st.divider()
-
-    if st.button(
-        "🔄 Generate Mask Plate",
-        disabled=(st.session_state.geometry is None),
-    ):
-        try:
-            with st.spinner("Generating mask plate..."):
-                mask_plate = create_mask_plate(
-                    st.session_state.geometry,
-                    plate_margin,
-                    clearance,
-                )
-
-                if use_sprues:
-                    mask_plate = add_sprues(
-                        mask_plate,
-                        sprue_width,
-                        sprue_max_length,
-                        sprue_max_count,
-                    )
-
-                if use_marks:
-                    mask_plate = add_alignment_marks(
-                        mask_plate,
-                        mark_type,
-                        mark_size,
-                        mark_offset,
-                    )
-
-                st.session_state.mask_plate = mask_plate
-
-            st.success("✓ Mask plate generated!")
-
-            num_holes = len(list(mask_plate.interiors))
-            bounds = mask_plate.bounds
-
-            st.info(
-                f"""
-**Plate Info:**
-- Holes/cutouts: {num_holes}
-- Plate width: {bounds[2] - bounds[0]:.2f} mm
-- Plate height: {bounds[3] - bounds[1]:.2f} mm
-- Plate area: {mask_plate.area:.2f} mm²
-"""
-            )
-
-        except Exception as e:
-            st.error(f"❌ Error generating mask plate: {e}")
-
-            import traceback
-
-            st.code(traceback.format_exc())
-            st.session_state.mask_plate = None
-
-
-with col2:
-    st.subheader("📊 Preview")
-
-    if st.session_state.get("debug_images"):
-        st.markdown("**Raster Debug Views**")
+    # Metadata summary
+    if st.session_state.input_kind == "svg" and st.session_state.metadata:
+        m = st.session_state.metadata
+        st.caption(
+            f"SVG — {m.get('num_paths','?')} paths, {m.get('num_valid_polygons','?')} polygons, "
+            f"{m.get('width',0):.1f} × {m.get('height',0):.1f} mm"
+        )
+    elif st.session_state.input_kind == "raster" and st.session_state.metadata:
+        m = st.session_state.metadata
         dbg = st.session_state.debug_images
-        preview_cols = st.columns(3)
+        if dbg:
+            dcols = st.columns(min(len(dbg), 3))
+            for i, (k, img) in enumerate(list(dbg.items())[:3]):
+                dcols[i].image(img, caption=k.replace("_", " ").title(), use_container_width=True, clamp=True)
+        st.caption(
+            f"Raster — {m.get('original_width_px','?')}×{m.get('original_height_px','?')} px → "
+            f"{st.session_state.target_width_mm:.0f}×{st.session_state.target_height_mm:.0f} mm"
+        )
 
-        if "input_rgb" in dbg:
-            preview_cols[0].image(
-                dbg["input_rgb"],
-                caption="Normalized Input",
-                width="stretch",
-            )
+else:
+    if st.session_state.uploaded_file_signature is not None:
+        _clear_all()
+    st.info("Upload artwork to begin.")
 
-        if "binary_mask" in dbg:
-            preview_cols[1].image(
-                dbg["binary_mask"],
-                caption="Binary Mask",
-                width="stretch",
-                clamp=True,
-            )
+st.divider()
 
-        if "cleaned_mask" in dbg:
-            preview_cols[2].image(
-                dbg["cleaned_mask"],
-                caption="Cleaned Mask",
-                width="stretch",
-                clamp=True,
-            )
 
-        st.divider()
+# ---------------------------------------------------------------------------
+# Generate all variants
+# ---------------------------------------------------------------------------
+can_generate = (
+    st.session_state.input_kind == "svg" and st.session_state.geometry is not None
+) or (
+    st.session_state.input_kind == "raster" and st.session_state.normalized_rgb is not None
+)
 
-    if st.session_state.mask_plate is not None:
+if st.button("Generate All Variant Mask Plates", disabled=not can_generate, type="primary"):
+    with st.spinner("Running all variants..."):
         try:
-            fig = plot_mask_plate(
-                st.session_state.mask_plate,
-                "Mask Plate (with cutouts)",
-            )
-            st.pyplot(fig)
-            plt.close(fig)
-        except Exception as e:
-            st.error(f"❌ Error rendering mask plate: {e}")
-
-    elif st.session_state.geometry is not None:
-        try:
-            source_label = "Artwork Geometry"
-
             if st.session_state.input_kind == "svg":
-                source_label = "SVG Geometry (Unified)"
-            elif st.session_state.input_kind == "raster":
-                source_label = "Raster Geometry (Vectorized)"
-
-            fig = plot_geometry(st.session_state.geometry, source_label)
-            st.pyplot(fig)
-            plt.close(fig)
-        except Exception as e:
-            st.error(f"❌ Error rendering preview: {e}")
-
-    else:
-        st.info("Upload artwork to see a 2D preview")
-
-    st.divider()
-    st.subheader("📥 Export")
-
-    col_export1, col_export2 = st.columns(2)
-
-    with col_export1:
-        if st.button(
-            "🔄 Generate STL",
-            disabled=(st.session_state.mask_plate is None),
-        ):
-            if st.session_state.mask_plate is None:
-                st.error(
-                    "No mask plate is currently available. "
-                    "Generate the mask plate first."
+                variants = run_svg_variants(
+                    st.session_state.geometry,
+                    plate_margin=plate_margin,
                 )
             else:
+                variants = run_raster_variants(
+                    normalized_rgb=st.session_state.normalized_rgb,
+                    target_width_mm=st.session_state.target_width_mm,
+                    target_height_mm=st.session_state.target_height_mm,
+                    plate_margin=plate_margin,
+                )
+
+            # Apply alignment marks if requested
+            if use_marks:
+                for v in variants:
+                    if v.plate is not None:
+                        try:
+                            v.plate = add_alignment_marks(
+                                v.plate, mark_type, mark_size, mark_offset
+                            )
+                        except Exception:
+                            pass  # marks are cosmetic; don't fail the variant
+
+            st.session_state.variants = variants
+            ok = sum(1 for v in variants if v.plate is not None)
+            st.success(f"Generated {ok}/{len(variants)} variants successfully.")
+        except Exception as exc:
+            import traceback as _tb
+            st.error(f"Variant generation failed: {exc}")
+            st.code(_tb.format_exc())
+
+
+# ---------------------------------------------------------------------------
+# Variant grid display
+# ---------------------------------------------------------------------------
+if st.session_state.variants:
+    variants: list[VariantResult] = st.session_state.variants
+    st.subheader("Variant Mask Plates")
+    st.caption(
+        "Each tile shows the 2D mask plate preview. "
+        "Red outlines = cutouts/apertures. Gray = plate material. "
+        "Download the STL directly from any tile."
+    )
+
+    # Lay out in rows of 3
+    COLS_PER_ROW = 3
+    rows = [variants[i:i + COLS_PER_ROW] for i in range(0, len(variants), COLS_PER_ROW)]
+
+    for row in rows:
+        cols = st.columns(COLS_PER_ROW)
+        for col, variant in zip(cols, row):
+            with col:
+                st.markdown(f"**{variant.label}**")
+                st.caption(variant.description)
+
+                if variant.error:
+                    st.error("Failed")
+                    with st.expander("Error details"):
+                        st.code(variant.error)
+                    continue
+
+                # 2D preview
                 try:
-                    with st.spinner("Generating 3D mesh..."):
-                        mesh = extrude_to_mesh(
-                            st.session_state.mask_plate,
-                            plate_thickness,
-                        )
-                        st.session_state.mesh = mesh
+                    fig = _plot_plate(variant.plate, title="", figsize=4.0)
+                    st.pyplot(fig, use_container_width=True)
+                    plt.close(fig)
+                except Exception as exc:
+                    st.warning(f"Preview error: {exc}")
 
-                        is_valid, message = validate_mesh(mesh)
+                # Stats
+                m = variant.metadata
+                holes = m.get("plate_holes", m.get("holes", "?"))
+                area = m.get("plate_area_mm2", m.get("area_mm2", 0))
+                sprues_on = m.get("sprues", False)
+                st.caption(
+                    f"Holes: {holes} | Area: {area:.0f} mm² | "
+                    f"{'Sprues: on' if sprues_on else 'Sprues: off'}"
+                )
 
-                        if is_valid:
-                            st.success(f"✓ 3D mesh generated! {message}")
-
-                            mesh_info = get_mesh_info(mesh)
-                            st.info(
-                                f"""
-**Mesh Info:**
-- Vertices: {mesh_info['vertices']:,}
-- Faces: {mesh_info['faces']:,}
-- Watertight: {'Yes' if mesh_info['watertight'] else 'No'}
-- Volume: {mesh_info['volume']:.2f} mm³ (if watertight)
-- Surface area: {mesh_info['surface_area']:.2f} mm²
-"""
-                            )
-
-                            stl_path = (
-                                Path(tempfile.gettempdir()) / "stencil_output.stl"
-                            )
-                            export_stl(mesh, str(stl_path))
-                            st.session_state.stl_path = str(stl_path)
-
-                        else:
-                            st.warning(f"⚠️ Mesh generated but has issues: {message}")
-                            st.session_state.mesh = mesh
-
-                except Exception as e:
-                    st.error(f"❌ Error generating STL: {e}")
-
-                    import traceback
-
-                    st.code(traceback.format_exc())
-                    st.session_state.mesh = None
-
-    with col_export2:
-        if st.session_state.stl_path and Path(st.session_state.stl_path).exists():
-            with open(st.session_state.stl_path, "rb") as f:
-                stl_data = f.read()
-
-            st.download_button(
-                label="💾 Download STL",
-                data=stl_data,
-                file_name="conformal_stencil.stl",
-                mime="application/octet-stream",
-            )
-        else:
-            st.button("💾 Download STL", disabled=True)
+                # STL export — always available, no watertight gate
+                stl_data, stl_status = _stl_bytes(variant.plate, plate_thickness)
+                if stl_data is not None:
+                    fname = f"stencil_{variant.name}.stl"
+                    st.download_button(
+                        label="Download STL",
+                        data=stl_data,
+                        file_name=fname,
+                        mime="application/octet-stream",
+                        key=f"dl_{variant.name}",
+                    )
+                    st.caption(stl_status)
+                else:
+                    st.error(stl_status)
 
     st.divider()
-    st.markdown(
-        """
----
-**Status:** Milestone 8 — Raster Silhouette Pipeline + STL Export  
-**Next:** Test corpus + tuning + additional segmentation strategies
-"""
-    )
+
+    # Geometry preview for raster variants (shows what the pipeline extracted)
+    if st.session_state.input_kind == "raster":
+        with st.expander("Geometry previews (what the pipeline extracted per variant)"):
+            geom_rows = [variants[i:i + COLS_PER_ROW] for i in range(0, len(variants), COLS_PER_ROW)]
+            for row in geom_rows:
+                gcols = st.columns(COLS_PER_ROW)
+                for gcol, variant in zip(gcols, row):
+                    with gcol:
+                        if variant.geometry is not None and not variant.geometry.is_empty:
+                            try:
+                                fig = _plot_geometry(
+                                    variant.geometry,
+                                    title=variant.label,
+                                    figsize=3.5,
+                                )
+                                st.pyplot(fig, use_container_width=True)
+                                plt.close(fig)
+                            except Exception as exc:
+                                st.caption(f"Preview error: {exc}")
+                        else:
+                            st.caption(f"{variant.label}: no geometry")
+
+st.divider()
+st.caption("Conformal Stencil Generator — multi-variant edition")

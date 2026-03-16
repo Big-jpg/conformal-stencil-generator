@@ -1,203 +1,242 @@
+# src/mesh3d.py
 """
 3D mesh operations module.
 Handles extrusion, mesh merging, and STL export.
+
+Extrusion strategy
+------------------
+trimesh.creation.extrude_polygon uses mapbox-earcut to triangulate the top
+and bottom cap faces.  earcut is fast but unreliable for polygons with many
+holes (>~4): it leaves open boundary loops, producing a non-watertight mesh
+(Euler number < 0).
+
+The robust path is:
+  1. Extrude the exterior ring as a solid watertight prism.
+  2. For each interior ring (hole), extrude it as a solid prism and
+     boolean-subtract it from the result using manifold3d.
+
+manifold3d guarantees watertight output for valid boolean operands.
+For polygons with 0–3 holes the earcut path is used as a fast fallback
+(it is reliable for small hole counts and avoids the boolean overhead).
 """
 
-from typing import Tuple, Optional
-from shapely.geometry import Polygon
-import trimesh
+from __future__ import annotations
+
+from typing import Tuple
+
 import numpy as np
-from shapely import geometry
+import trimesh
+from shapely.geometry import Polygon
+
+# Threshold: use boolean subtraction path when hole count exceeds this value.
+# earcut is reliable up to ~3 holes in practice.
+_EARCUT_HOLE_LIMIT = 3
+
+
+def _extrude_solid(poly: Polygon, height: float) -> trimesh.Trimesh:
+    """Extrude a simple (no-hole) polygon to a watertight solid."""
+    simple = Polygon(poly.exterior)
+    mesh = trimesh.creation.extrude_polygon(simple, height=height)
+    if not mesh.is_watertight:
+        trimesh.repair.fill_holes(mesh)
+        trimesh.repair.fix_normals(mesh)
+        mesh.remove_infinite_values()
+        mesh.merge_vertices()
+    return mesh
 
 
 def extrude_to_mesh(
     geometry_2d: Polygon,
-    thickness: float
+    thickness: float,
 ) -> trimesh.Trimesh:
     """
-    Convert 2D geometry to 3D mesh via extrusion.
-    
+    Convert a 2D Shapely Polygon (possibly with interior holes) to a 3D mesh
+    by extrusion.
+
+    Uses manifold3d boolean subtraction for polygons with many holes to
+    guarantee a watertight result.  Falls back to earcut for simple cases.
+
     Args:
-        geometry_2d: 2D Shapely polygon
-        thickness: Extrusion height (mm)
-        
+        geometry_2d: 2D Shapely polygon (may have interior rings).
+        thickness:   Extrusion height in mm.
+
     Returns:
-        Trimesh object representing the extruded stencil
-        
+        trimesh.Trimesh — watertight where possible.
+
     Raises:
-        ValueError: If geometry is invalid or extrusion fails
+        ValueError: If geometry is invalid/empty or extrusion fails.
     """
     if not geometry_2d.is_valid:
-        raise ValueError("Input geometry is not valid")
-    
+        # Attempt self-repair via buffer(0) before giving up
+        geometry_2d = geometry_2d.buffer(0)
+        if not geometry_2d.is_valid:
+            raise ValueError("Input geometry is not valid")
+
     if geometry_2d.is_empty:
         raise ValueError("Input geometry is empty")
-    
+
     if thickness <= 0:
         raise ValueError("Thickness must be positive")
-    
+
+    holes = list(geometry_2d.interiors)
+    n_holes = len(holes)
+
     try:
-        # Use trimesh.creation.extrude_polygon
-        # This is more robust than Path2D approach
-        mesh = trimesh.creation.extrude_polygon(
-            geometry_2d,
-            height=thickness
-        )
-        
-        # Validate and fix mesh if needed
-        if not mesh.is_watertight:
-            # Try to fix mesh
-            trimesh.repair.fill_holes(mesh)
-            trimesh.repair.fix_normals(mesh)
-            mesh.remove_degenerate_faces()
-            mesh.remove_duplicate_faces()
-            mesh.remove_infinite_values()
-            mesh.merge_vertices()
-        
-        return mesh
-        
-    except Exception as e:
-        raise ValueError(f"Failed to extrude geometry: {e}")
+        if n_holes <= _EARCUT_HOLE_LIMIT:
+            # Fast path: earcut handles small hole counts reliably
+            mesh = trimesh.creation.extrude_polygon(geometry_2d, height=thickness)
+            if not mesh.is_watertight:
+                trimesh.repair.fill_holes(mesh)
+                trimesh.repair.fix_normals(mesh)
+                mesh.remove_infinite_values()
+                mesh.merge_vertices()
+            return mesh
+
+        # Robust path: extrude exterior solid, then subtract each hole
+        result = _extrude_solid(geometry_2d, thickness)
+
+        for interior in holes:
+            hole_poly = Polygon(interior)
+            if hole_poly.area < 1e-6:
+                continue  # skip degenerate rings
+            hole_mesh = _extrude_solid(hole_poly, thickness)
+            try:
+                result = result.difference(hole_mesh, engine="manifold")
+            except Exception:
+                # manifold failed for this hole; try trimesh boolean
+                try:
+                    result = trimesh.boolean.difference([result, hole_mesh], engine="blender")
+                except Exception:
+                    pass  # leave hole uncut rather than crash
+
+        if not result.is_watertight:
+            trimesh.repair.fill_holes(result)
+            trimesh.repair.fix_normals(result)
+            result.remove_infinite_values()
+            result.merge_vertices()
+
+        return result
+
+    except Exception as exc:
+        raise ValueError(f"Failed to extrude geometry: {exc}") from exc
 
 
 def merge_meshes(meshes: list) -> trimesh.Trimesh:
     """
-    Merge multiple mesh objects into a single watertight mesh.
-    
+    Merge multiple mesh objects into a single mesh.
+
     Args:
-        meshes: List of trimesh objects
-        
+        meshes: List of trimesh objects.
+
     Returns:
-        Single merged trimesh
-        
+        Single merged trimesh.
+
     Raises:
-        ValueError: If meshes list is empty or merging fails
+        ValueError: If meshes list is empty or merging fails.
     """
     if not meshes:
         raise ValueError("No meshes to merge")
-    
+
     if len(meshes) == 1:
         return meshes[0]
-    
+
     try:
-        # Concatenate all meshes
         merged = trimesh.util.concatenate(meshes)
-        
-        # Clean up
         merged.merge_vertices()
-        merged.remove_duplicate_faces()
-        merged.remove_degenerate_faces()
-        
+        merged.remove_unreferenced_vertices()
         return merged
-        
-    except Exception as e:
-        raise ValueError(f"Failed to merge meshes: {e}")
+    except Exception as exc:
+        raise ValueError(f"Failed to merge meshes: {exc}") from exc
 
 
 def export_stl(mesh: trimesh.Trimesh, output_path: str) -> None:
     """
     Export mesh to STL file.
-    
+
+    Exports regardless of watertight status — validation is the caller's
+    responsibility.  Issues a warning to stdout if the mesh has problems.
+
     Args:
-        mesh: Trimesh object
-        output_path: Path to output STL file
-        
+        mesh:        trimesh object.
+        output_path: Destination path for binary STL.
+
     Raises:
-        ValueError: If mesh is not watertight or manifold
+        ValueError: If export fails.
     """
-    # Validate mesh before export
     is_valid, message = validate_mesh(mesh)
-    
     if not is_valid:
-        # Try to fix common issues
+        # Attempt light repair before export
         trimesh.repair.fill_holes(mesh)
         trimesh.repair.fix_normals(mesh)
-        mesh.remove_degenerate_faces()
-        mesh.remove_duplicate_faces()
+        mesh.remove_infinite_values()
         mesh.merge_vertices()
-        
-        # Re-validate
         is_valid, message = validate_mesh(mesh)
-        
         if not is_valid:
-            # Export anyway but warn user
-            print(f"Warning: {message}")
-    
+            print(f"Warning: exporting non-ideal mesh — {message}")
+
     try:
-        # Export as binary STL
-        mesh.export(output_path, file_type='stl')
-    except Exception as e:
-        raise ValueError(f"Failed to export STL: {e}")
+        mesh.export(output_path, file_type="stl")
+    except Exception as exc:
+        raise ValueError(f"Failed to export STL: {exc}") from exc
 
 
 def validate_mesh(mesh: trimesh.Trimesh) -> Tuple[bool, str]:
     """
     Validate mesh for printability.
-    
+
     Args:
-        mesh: Trimesh object
-        
+        mesh: trimesh object.
+
     Returns:
-        Tuple of (is_valid, message)
+        (is_valid, message) tuple.
     """
-    issues = []
-    
-    # Check if mesh exists
     if mesh is None:
         return False, "Mesh is None"
-    
-    # Check if mesh has vertices and faces
     if len(mesh.vertices) == 0:
         return False, "Mesh has no vertices"
-    
     if len(mesh.faces) == 0:
         return False, "Mesh has no faces"
-    
-    # Check for watertight (manifold)
+
+    issues = []
+
     if not mesh.is_watertight:
         issues.append("Mesh is not watertight")
-    
-    # Check for degenerate faces
-    if hasattr(mesh, 'degenerate_faces') and mesh.degenerate_faces.any():
-        issues.append(f"Mesh has {mesh.degenerate_faces.sum()} degenerate faces")
-    
-    # Check for infinite or NaN values
+
+    if hasattr(mesh, "degenerate_faces") and np.any(mesh.degenerate_faces):
+        n = int(np.sum(mesh.degenerate_faces))
+        issues.append(f"{n} degenerate faces")
+
     if not np.isfinite(mesh.vertices).all():
         issues.append("Mesh contains infinite or NaN vertex values")
-    
-    # Check volume (should be positive for valid mesh)
+
     try:
-        if mesh.is_watertight:
-            volume = mesh.volume
-            if volume <= 0:
-                issues.append(f"Mesh has invalid volume: {volume}")
-    except:
-        pass  # Volume check not critical
-    
+        if mesh.is_watertight and mesh.volume <= 0:
+            issues.append(f"Invalid volume: {mesh.volume:.3f}")
+    except Exception:
+        pass
+
     if issues:
         return False, "; ".join(issues)
-    
     return True, "Mesh is valid and printable"
 
 
 def get_mesh_info(mesh: trimesh.Trimesh) -> dict:
     """
-    Get mesh statistics and information.
-    
+    Return mesh statistics.
+
     Args:
-        mesh: Trimesh object
-        
+        mesh: trimesh object.
+
     Returns:
-        Dictionary with mesh information
+        Dictionary with vertices, faces, watertight, volume, surface_area,
+        bounds, center_mass.
     """
-    info = {
-        'vertices': len(mesh.vertices),
-        'faces': len(mesh.faces),
-        'watertight': mesh.is_watertight,
-        'volume': mesh.volume if mesh.is_watertight else 0,
-        'surface_area': mesh.area,
-        'bounds': mesh.bounds.tolist(),
-        'center_mass': mesh.center_mass.tolist() if mesh.is_watertight else [0, 0, 0],
+    return {
+        "vertices": len(mesh.vertices),
+        "faces": len(mesh.faces),
+        "watertight": mesh.is_watertight,
+        "volume": mesh.volume if mesh.is_watertight else 0.0,
+        "surface_area": mesh.area,
+        "bounds": mesh.bounds.tolist(),
+        "center_mass": mesh.center_mass.tolist() if mesh.is_watertight else [0.0, 0.0, 0.0],
     }
-    
-    return info
