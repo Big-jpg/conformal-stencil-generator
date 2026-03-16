@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import streamlit as st
 from shapely.geometry import MultiPolygon, Polygon
 
-from geom2d import add_alignment_marks
+from geom2d import add_alignment_marks, _count_holes, _total_area, PlateGeom
 from mesh3d import export_stl, extrude_to_mesh, get_mesh_info, validate_mesh
 from pipelines import RasterSilhouettePipeline
 from raster_io import load_raster, normalize_canvas
@@ -62,13 +62,22 @@ def _clear_all() -> None:
         st.session_state[k] = v
 
 
-def _plot_plate(plate: Polygon, title: str = "Mask Plate", figsize: float = 5.0):
+def _plot_plate(plate: PlateGeom, title: str = "Mask Plate", figsize: float = 5.0):
+    """Render a plate (Polygon or MultiPolygon) as a 2D preview.
+
+    Rendering convention:
+    - Gray fill  = solid plate material (the frame and any floating islands)
+    - White fill = cutout apertures (interior rings / holes)
+    - Red outline = cutout boundary
+    """
     fig, ax = plt.subplots(figsize=(figsize, figsize))
-    x, y = plate.exterior.xy
-    ax.fill(x, y, alpha=0.7, fc="lightgray", ec="black", linewidth=1.5)
-    for interior in plate.interiors:
-        x, y = interior.xy
-        ax.fill(x, y, alpha=1.0, fc="white", ec="#e05050", linewidth=1.0)
+    polys = [plate] if isinstance(plate, Polygon) else list(plate.geoms)
+    for poly in polys:
+        x, y = poly.exterior.xy
+        ax.fill(x, y, alpha=0.7, fc="lightgray", ec="black", linewidth=1.5)
+        for interior in poly.interiors:
+            x, y = interior.xy
+            ax.fill(x, y, alpha=1.0, fc="white", ec="#e05050", linewidth=1.0)
     ax.set_aspect("equal")
     ax.grid(True, alpha=0.2)
     ax.set_title(title, fontsize=10, fontweight="bold")
@@ -98,7 +107,7 @@ def _plot_geometry(geometry: Polygon | MultiPolygon, title: str, figsize: float 
     return fig
 
 
-def _stl_bytes(plate: Polygon, thickness: float) -> tuple[bytes | None, str]:
+def _stl_bytes(plate: PlateGeom, thickness: float) -> tuple[bytes | None, str]:
     """
     Extrude plate to mesh and return (stl_bytes, status_message).
     Always returns bytes if extrusion succeeds, regardless of watertight status.

@@ -22,11 +22,11 @@ For polygons with 0–3 holes the earcut path is used as a fast fallback
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Tuple, Union
 
 import numpy as np
 import trimesh
-from shapely.geometry import Polygon
+from shapely.geometry import MultiPolygon, Polygon
 
 # Threshold: use boolean subtraction path when hole count exceeds this value.
 # earcut is reliable up to ~3 holes in practice.
@@ -46,7 +46,7 @@ def _extrude_solid(poly: Polygon, height: float) -> trimesh.Trimesh:
 
 
 def extrude_to_mesh(
-    geometry_2d: Polygon,
+    geometry_2d: Union[Polygon, MultiPolygon],
     thickness: float,
 ) -> trimesh.Trimesh:
     """
@@ -56,8 +56,11 @@ def extrude_to_mesh(
     Uses manifold3d boolean subtraction for polygons with many holes to
     guarantee a watertight result.  Falls back to earcut for simple cases.
 
+    For MultiPolygon input (plate frame + floating solid islands), each
+    component is extruded separately and the meshes are concatenated.
+
     Args:
-        geometry_2d: 2D Shapely polygon (may have interior rings).
+        geometry_2d: 2D Shapely Polygon or MultiPolygon.
         thickness:   Extrusion height in mm.
 
     Returns:
@@ -66,17 +69,49 @@ def extrude_to_mesh(
     Raises:
         ValueError: If geometry is invalid/empty or extrusion fails.
     """
+    if geometry_2d is None:
+        raise ValueError("Input geometry is None")
+
+    if thickness <= 0:
+        raise ValueError("Thickness must be positive")
+
+    # MultiPolygon: extrude each component separately and concatenate.
+    # Components are geometrically disjoint (separate solid islands + frame),
+    # so they must NOT be merged with merge_vertices — that would weld shared
+    # boundary vertices between adjacent solids and create non-manifold edges.
+    # Use a minimum area threshold to discard degenerate slivers from sprues.
+    _MIN_COMPONENT_AREA = 0.5  # mm²
+    if isinstance(geometry_2d, MultiPolygon):
+        meshes = []
+        for poly in geometry_2d.geoms:
+            if poly.is_empty or poly.area < _MIN_COMPONENT_AREA:
+                continue
+            meshes.append(_extrude_single_polygon(poly, thickness))
+        if not meshes:
+            raise ValueError("MultiPolygon has no valid components")
+        if len(meshes) == 1:
+            return meshes[0]
+        # Concatenate without merging — each component is an independent solid.
+        # trimesh.Scene.dump() or STL export handles multi-body meshes correctly.
+        combined = trimesh.util.concatenate(meshes)
+        combined.remove_unreferenced_vertices()
+        return combined
+
+    return _extrude_single_polygon(geometry_2d, thickness)
+
+
+def _extrude_single_polygon(
+    geometry_2d: Polygon,
+    thickness: float,
+) -> trimesh.Trimesh:
+    """Extrude a single Shapely Polygon (may have interior rings)."""
     if not geometry_2d.is_valid:
-        # Attempt self-repair via buffer(0) before giving up
         geometry_2d = geometry_2d.buffer(0)
         if not geometry_2d.is_valid:
             raise ValueError("Input geometry is not valid")
 
     if geometry_2d.is_empty:
         raise ValueError("Input geometry is empty")
-
-    if thickness <= 0:
-        raise ValueError("Thickness must be positive")
 
     holes = list(geometry_2d.interiors)
     n_holes = len(holes)

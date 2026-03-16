@@ -26,7 +26,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from geom2d import add_sprues, create_mask_plate
+from geom2d import add_sprues, create_mask_plate, _count_holes, _total_area
 from mesh3d import extrude_to_mesh, get_mesh_info, validate_mesh
 from pipelines.raster_silhouette import RasterSilhouettePipeline
 from raster_io import normalize_canvas
@@ -119,14 +119,14 @@ def run_test(name: str, img: np.ndarray, expected_holes_in_geometry: int) -> boo
 
         # Create plate and add sprues
         plate = create_mask_plate(geom, plate_margin=10, clearance=0.5)
-        holes_before = len(list(plate.interiors))
+        holes_before = _count_holes(plate)
         print(f"Plate holes before sprues: {holes_before}")
 
         plate_sprued = add_sprues(plate, sprue_width=2.0, max_length=80, max_count=20)
-        holes_after = len(list(plate_sprued.interiors))
+        holes_after = _count_holes(plate_sprued)
         print(f"Plate holes after sprues:  {holes_after}")
 
-        area_removed = plate.area - plate_sprued.area
+        area_removed = _total_area(plate) - _total_area(plate_sprued)
         print(f"Area removed by sprues: {area_removed:.1f} mm²")
 
         # Each sprue should remove roughly sprue_width × channel_length area.

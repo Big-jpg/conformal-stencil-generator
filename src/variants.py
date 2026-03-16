@@ -39,7 +39,10 @@ import numpy as np
 from shapely.geometry import MultiPolygon, Polygon
 from shapely.ops import unary_union
 
-from geom2d import add_alignment_marks, add_sprues, create_mask_plate
+from geom2d import (
+    add_alignment_marks, add_sprues, create_mask_plate,
+    _count_holes, _total_area, PlateGeom,
+)
 from pipelines.raster_silhouette import RasterSilhouettePipeline
 
 
@@ -48,7 +51,7 @@ class VariantResult:
     name: str
     label: str
     description: str
-    plate: Optional[Polygon]
+    plate: Optional[PlateGeom]
     geometry: Optional[MultiPolygon]   # the artwork geometry used
     error: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -70,7 +73,7 @@ def _build_plate(
     mark_type: str = "Crosshair",
     mark_size: float = 5.0,
     mark_offset: float = 10.0,
-) -> Polygon:
+) -> PlateGeom:
     plate = create_mask_plate(geometry, plate_margin, clearance)
     if use_sprues:
         plate = add_sprues(plate, sprue_width, sprue_max_length, sprue_max_count)
@@ -193,8 +196,8 @@ def run_svg_variants(
                 plate=plate,
                 geometry=geom,
                 metadata={
-                    "holes": len(list(plate.interiors)),
-                    "area_mm2": plate.area,
+                    "holes": _count_holes(plate),
+                    "area_mm2": _total_area(plate),
                     "clearance": spec.get("clearance", 0.0),
                     "sprues": spec.get("use_sprues", False),
                 },
@@ -395,8 +398,8 @@ def run_raster_variants(
                 metadata={
                     "polygon_count": len(polys),
                     "geometry_holes": total_holes_in_geom,
-                    "plate_holes": len(list(plate.interiors)),
-                    "plate_area_mm2": plate.area,
+                    "plate_holes": _count_holes(plate),
+                    "plate_area_mm2": _total_area(plate),
                     "clearance": plate_spec.get("clearance", 0.0),
                     "sprues": plate_spec.get("use_sprues", False),
                     "threshold": settings.get("threshold", "Otsu"),
