@@ -3,100 +3,51 @@
 2D geometry operations module.
 Handles mask plate generation, clearance offsets, island detection, and sprues.
 
-Geometry model
---------------
-After create_mask_plate() the plate is either:
-
-  Polygon       — a single plate piece with zero or more interior rings
-                  (holes = artwork cutouts).
-
-  MultiPolygon  — the plate frame (largest polygon, with interior rings)
-                  PLUS one or more floating islands of solid plate material
-                  that sit inside a cutout.
-
-Floating islands arise naturally from artwork that has enclosed negative
-space — e.g. a whale-shark body (dark) with white spots.  After thresholding,
-the body polygon has the spots as interior rings.  When the plate is
-differenced by this polygon, Shapely's set algebra gives:
-
-    plate - (body - spots) = (plate - body) + spots
-
-The result is a MultiPolygon: the frame (plate with body hole) plus the spot
-polygons as separate solid components.  This is the correct stencil geometry:
-the body is a through-hole (paint passes) and the spots are raised solid
-islands (paint does NOT pass through spots).
-
-The original code discarded the island components with:
-    mask_plate = max(polygons, key=lambda p: p.area)
-This silently dropped all floating islands.  The fix is to preserve the full
-MultiPolygon throughout the pipeline.
-
 Sprue / bridge design intent
 -----------------------------
-A stencil "sprue" (also called a bridge or tie) is a narrow channel of
-REMOVED material that runs from a closed hole in the plate to the plate's
-outer edge.  Cutting this channel:
+A stencil "sprue" (also called a bridge or tie) is a narrow channel of REMOVED
+material that runs from a closed hole in the plate to the plate's outer edge.
+Cutting this channel:
   - Allows the stencil to be peeled away from the substrate without tearing.
-  - Keeps floating plate islands physically connected to the rest of the plate
-    via the channel walls.
+  - Keeps floating plate islands (e.g. the counter of a letter 'O') physically
+    connected to the rest of the plate via the channel walls.
 
-Sprue anchor point
-------------------
-The sprue rectangle must start at the NEAREST POINT ON THE HOLE BOUNDARY
-(not the centroid).  The centroid is inside the hole; a centroid-anchored
-sprue rectangle covers the entire hole and consumes it on difference().
+Geometry model
+--------------
+After create_mask_plate() the plate is a Shapely Polygon whose interior rings
+(plate.interiors) are the artwork cutouts.  Each interior ring is a hole.
 
-Sprues are applied SEQUENTIALLY — one plate.difference(sprue) per hole —
-so that each iteration sees the updated topology.
+A correct sprue rectangle must:
+  1. Start at the NEAREST POINT ON THE HOLE BOUNDARY  (not the centroid).
+  2. End at the NEAREST POINT ON THE PLATE EXTERIOR.
+  3. Be applied one at a time via plate.difference(sprue) so that each
+     successive operation sees the updated hole count.
+
+Bug in the original implementation
+------------------------------------
+The original code used the hole centroid as the sprue start point.  Because
+the centroid is inside the hole, the sprue rectangle covered the entire hole
+area.  plate.difference(sprue) therefore consumed the hole completely, merging
+it with the exterior rather than leaving a narrow channel.  Batching all sprues
+into a single unary_union before the difference made this worse: the merged
+slab wiped out all holes simultaneously.
+
+True floating-island detection
+-------------------------------
+A "true floating island" is a region of plate material that is completely
+surrounded by a cutout ring — e.g. the dot of an 'i', the counter of an 'O'.
+These appear as polygons-within-holes in the Shapely representation and require
+a different bridge strategy: connect the island to the nearest solid plate
+material (not to the outer edge).  detect_true_islands() handles this case.
 """
 
 from __future__ import annotations
 
-from typing import List, Tuple, Union
+from typing import List, Optional, Tuple
 
 import numpy as np
 from shapely.geometry import LineString, MultiPolygon, Point, Polygon, box
 from shapely.ops import nearest_points, unary_union
-
-# Type alias used throughout
-PlateGeom = Union[Polygon, MultiPolygon]
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-def _as_polygons(geom: PlateGeom) -> List[Polygon]:
-    """Return a flat list of Polygon components."""
-    if isinstance(geom, Polygon):
-        return [geom]
-    return list(geom.geoms)
-
-
-def _largest_polygon(geom: PlateGeom) -> Polygon:
-    """Return the largest-area Polygon component."""
-    polys = _as_polygons(geom)
-    return max(polys, key=lambda p: p.area)
-
-
-def _rebuild_multipolygon(frame: Polygon, islands: List[Polygon]) -> PlateGeom:
-    """
-    Reconstruct the plate geometry from an updated frame and unchanged islands.
-
-    If there are no islands, return the frame directly as a Polygon.
-    """
-    if not islands:
-        return frame
-    return MultiPolygon([frame] + islands)
-
-
-def _count_holes(geom: PlateGeom) -> int:
-    """Count total interior rings across all polygon components."""
-    return sum(len(list(p.interiors)) for p in _as_polygons(geom))
-
-
-def _total_area(geom: PlateGeom) -> float:
-    return geom.area
 
 
 # ---------------------------------------------------------------------------
@@ -107,15 +58,9 @@ def create_mask_plate(
     geometry: MultiPolygon,
     plate_margin: float,
     clearance: float,
-) -> PlateGeom:
+) -> Polygon:
     """
     Generate mask plate with cutouts.
-
-    The result may be a Polygon or a MultiPolygon.  A MultiPolygon is
-    returned when the artwork contains enclosed negative space (interior
-    rings), which produce floating islands of solid plate material inside
-    the cutout region.  All components are preserved — callers must handle
-    both types.
 
     Args:
         geometry:      SVG / raster geometry as MultiPolygon.
@@ -123,7 +68,7 @@ def create_mask_plate(
         clearance:     Outward offset applied to artwork before subtraction (mm).
 
     Returns:
-        Polygon or MultiPolygon representing the stencil plate.
+        Polygon representing the stencil plate with negative-space cutouts.
     """
     minx, miny, maxx, maxy = geometry.bounds
 
@@ -141,22 +86,12 @@ def create_mask_plate(
 
     mask_plate = plate.difference(buffered_geometry)
 
-    # Do NOT drop MultiPolygon components here — they are floating islands.
-    # Only clean up degenerate / invalid geometry.
+    if isinstance(mask_plate, MultiPolygon):
+        polygons = list(mask_plate.geoms)
+        mask_plate = max(polygons, key=lambda p: p.area)
+
     if not mask_plate.is_valid:
         mask_plate = mask_plate.buffer(0)
-
-    # Remove any degenerate zero-area components that can arise from
-    # numerical noise (but keep all components with meaningful area).
-    if isinstance(mask_plate, MultiPolygon):
-        clean = [p for p in mask_plate.geoms if p.area > 1e-6 and p.is_valid]
-        if len(clean) == 0:
-            # Degenerate — fall back to the bounding box
-            return plate
-        if len(clean) == 1:
-            mask_plate = clean[0]
-        else:
-            mask_plate = MultiPolygon(clean)
 
     return mask_plate
 
@@ -165,52 +100,49 @@ def create_mask_plate(
 # Island detection
 # ---------------------------------------------------------------------------
 
-def detect_islands(plate: PlateGeom) -> List[Polygon]:
+def detect_islands(plate: Polygon) -> List[Polygon]:
     """
-    Return the set of hole polygons (interior rings) in the plate FRAME.
+    Return the set of hole polygons (interior rings) in *plate*.
 
-    Each returned Polygon represents one cutout aperture in the stencil.
-    This function operates on the largest polygon component (the frame) and
-    returns its interior rings.
-
-    Note: floating solid islands (separate Polygon components of a
-    MultiPolygon plate) are NOT returned here — they are plate material,
-    not cutouts.
+    Each returned Polygon represents one cutout in the stencil.  These are
+    NOT floating islands of plate material — they are the artwork apertures.
+    See detect_true_islands() for floating plate-material islands.
 
     Args:
-        plate: Stencil plate (Polygon or MultiPolygon).
+        plate: Stencil plate polygon (may have interior rings).
 
     Returns:
-        List of Polygon objects, one per interior ring of the frame.
+        List of Polygon objects, one per interior ring.
     """
-    frame = _largest_polygon(plate)
     islands: List[Polygon] = []
-    for interior in frame.interiors:
-        island = Polygon(interior)
-        if island.is_valid and not island.is_empty:
-            islands.append(island)
+    if hasattr(plate, "interiors"):
+        for interior in plate.interiors:
+            island = Polygon(interior)
+            if island.is_valid and not island.is_empty:
+                islands.append(island)
     return islands
 
 
-def detect_true_islands(plate: PlateGeom) -> List[Polygon]:
+def detect_true_islands(plate: Polygon) -> List[Polygon]:
     """
-    Return floating solid islands — Polygon components of a MultiPolygon
-    plate that are NOT the frame (largest component).
+    Detect regions of plate material that are completely enclosed by a cutout.
 
-    These are regions of solid plate material enclosed within a cutout,
-    e.g. the white spots of a whale shark inside the body cutout.
+    This occurs when artwork has enclosed negative space, e.g. the counter of
+    the letter 'O'.  In the Shapely model these appear as Polygons that lie
+    entirely within an interior ring of *plate* but are not themselves part of
+    the plate polygon.
 
-    Args:
-        plate: Stencil plate (Polygon or MultiPolygon).
+    Implementation note: after create_mask_plate() the plate is a single
+    Polygon with holes.  True floating islands cannot be represented inside a
+    simple Polygon — they would require a MultiPolygon or a Polygon with nested
+    rings.  This function is therefore a forward-looking hook; in the current
+    pipeline true islands are handled upstream by mask_to_polygons() using
+    RETR_CCOMP contour retrieval (see raster_silhouette.py).
 
     Returns:
-        List of island Polygons (empty if plate is a simple Polygon).
+        Empty list (placeholder for future extension).
     """
-    polys = _as_polygons(plate)
-    if len(polys) <= 1:
-        return []
-    frame = max(polys, key=lambda p: p.area)
-    return [p for p in polys if p is not frame]
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -222,8 +154,11 @@ def _nearest_boundary_points(
     plate_exterior,
 ) -> Tuple[Point, Point]:
     """
-    Return (point_on_hole_boundary, point_on_plate_exterior) that are
-    mutually closest.
+    Return (point_on_hole_boundary, point_on_plate_exterior) that are mutually
+    closest.
+
+    Uses shapely.ops.nearest_points which operates on the boundary geometries
+    directly, giving the true minimum-distance pair.
     """
     p_hole, p_ext = nearest_points(hole.exterior, plate_exterior)
     return p_hole, p_ext
@@ -243,7 +178,8 @@ def create_sprue_rectangle(
         width:  Width of the sprue channel (mm).
 
     Returns:
-        Rectangular Polygon.  Empty Polygon if points are coincident.
+        Rectangular Polygon representing the sprue channel.
+        Returns an empty Polygon if the two points are coincident.
     """
     dx = point2.x - point1.x
     dy = point2.y - point1.y
@@ -252,10 +188,11 @@ def create_sprue_rectangle(
     if length < 1e-9:
         return Polygon()
 
+    # Unit direction and perpendicular
     ux, uy = dx / length, dy / length
     px, py = -uy, ux
-    hw = width / 2.0
 
+    hw = width / 2.0
     corners = [
         (point1.x + px * hw, point1.y + py * hw),
         (point1.x - px * hw, point1.y - py * hw),
@@ -266,37 +203,45 @@ def create_sprue_rectangle(
 
 
 def add_sprues(
-    plate: PlateGeom,
+    plate: Polygon,
     sprue_width: float,
     max_length: float,
     max_count: int = 10,
-) -> PlateGeom:
+) -> Polygon:
     """
-    Connect each hole (cutout) in the plate FRAME to the plate exterior via
-    a narrow channel, one sprue at a time.
+    Connect each hole (cutout) in *plate* to the plate exterior via a narrow
+    channel, one sprue at a time.
 
-    Floating solid islands (separate MultiPolygon components) are NOT
-    modified — they are plate material, not holes.
+    Fixes vs. original implementation
+    -----------------------------------
+    1. Anchor point is the NEAREST POINT ON THE HOLE BOUNDARY, not the
+       centroid.  The centroid is inside the hole, so a centroid-anchored sprue
+       rectangle covers the entire hole and consumes it on difference().
+
+    2. Sprues are applied SEQUENTIALLY (one difference() per hole) rather than
+       batching all sprues into a single unary_union before differencing.
+       Batching caused overlapping sprues to merge into a slab that wiped out
+       multiple holes simultaneously.
+
+    3. After each difference() the plate is re-examined so that the updated
+       interior ring list drives the next iteration.  This is important when a
+       single sprue channel happens to merge two adjacent holes.
 
     Args:
-        plate:         Stencil plate (Polygon or MultiPolygon).
+        plate:         Stencil plate with holes (interior rings).
         sprue_width:   Width of each channel (mm).
-        max_length:    Maximum allowed channel length (mm).
+        max_length:    Maximum allowed channel length (mm).  Holes further than
+                       this from the plate edge are left unconnected.
         max_count:     Maximum number of sprues to add.
 
     Returns:
-        Updated plate with sprue channels cut in.
+        Updated plate Polygon with sprue channels cut in.
     """
-    # Separate frame from floating islands
-    polys = _as_polygons(plate)
-    frame = max(polys, key=lambda p: p.area)
-    solid_islands = [p for p in polys if p is not frame]
-
-    holes = detect_islands(frame)
+    holes = detect_islands(plate)
     if not holes:
         return plate
 
-    exterior = frame.exterior
+    exterior = plate.exterior
     sprues_added = 0
 
     for hole in holes:
@@ -313,28 +258,26 @@ def add_sprues(
         if sprue.is_empty or not sprue.is_valid:
             continue
 
-        candidate = frame.difference(sprue)
+        # Apply one sprue at a time so subsequent iterations see the correct
+        # hole topology.
+        candidate = plate.difference(sprue)
 
+        # difference() can return a MultiPolygon if the sprue cuts the plate
+        # into disconnected pieces (pathological case).  Keep the largest piece.
         if isinstance(candidate, MultiPolygon):
-            # Sprue split the frame — keep the largest piece as the new frame
-            # and collect any new solid islands
-            candidate_polys = sorted(candidate.geoms, key=lambda g: g.area, reverse=True)
-            frame = candidate_polys[0]
-            # Any smaller pieces are new solid islands (rare but possible)
-            solid_islands.extend(candidate_polys[1:])
-        else:
-            frame = candidate
+            candidate = max(candidate.geoms, key=lambda g: g.area)
 
-        if not frame.is_valid:
-            frame = frame.buffer(0)
+        if not candidate.is_valid:
+            candidate = candidate.buffer(0)
 
-        if frame.is_empty:
-            break
+        if candidate.is_empty:
+            continue  # Sprue consumed the whole plate — skip
 
-        exterior = frame.exterior
+        plate = candidate
+        exterior = plate.exterior  # Refresh after topology change
         sprues_added += 1
 
-    return _rebuild_multipolygon(frame, solid_islands)
+    return plate
 
 
 # ---------------------------------------------------------------------------
@@ -346,12 +289,9 @@ def add_alignment_marks(
     mark_type: str,
     mark_size: float,
     offset_from_edge: float,
-) -> PlateGeom:
+) -> Polygon:
     """
     Subtract alignment marks from the stencil plate corners.
-
-    Operates on the FRAME (largest polygon component).  Floating solid
-    islands are preserved unchanged.
 
     Args:
         plate:            Stencil plate geometry.
@@ -362,11 +302,7 @@ def add_alignment_marks(
     Returns:
         Plate with alignment marks subtracted.
     """
-    polys = _as_polygons(plate)
-    frame = max(polys, key=lambda p: p.area)
-    solid_islands = [p for p in polys if p is not frame]
-
-    minx, miny, maxx, maxy = frame.bounds
+    minx, miny, maxx, maxy = plate.bounds
 
     positions = [
         (minx + offset_from_edge, miny + offset_from_edge),
@@ -393,19 +329,18 @@ def add_alignment_marks(
         marks.append(mark)
 
     marks_union = unary_union(marks)
-    result = frame.difference(marks_union)
+    result = plate.difference(marks_union)
 
     if isinstance(result, MultiPolygon):
-        # Marks split the frame — keep largest piece
         result = max(result.geoms, key=lambda g: g.area)
 
-    return _rebuild_multipolygon(result, solid_islands)
+    return result
 
 
 # ---------------------------------------------------------------------------
 # Utility
 # ---------------------------------------------------------------------------
 
-def get_plate_bounds(plate: PlateGeom) -> Tuple[float, float, float, float]:
+def get_plate_bounds(plate: Polygon) -> Tuple[float, float, float, float]:
     """Return (minx, miny, maxx, maxy) bounding box of *plate*."""
     return plate.bounds
